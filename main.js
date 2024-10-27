@@ -8,11 +8,13 @@
 // you need to create an adapter
 const utils = require('@iobroker/adapter-core');
 const axios = require('axios').default;
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const qs = require('qs');
 const crypto = require('crypto');
 const Json2iob = require('json2iob');
 const { wrapper } = require('axios-cookiejar-support');
 const tough = require('tough-cookie');
+const { HttpCookieAgent, HttpsCookieAgent, createCookieAgent } = require('http-cookie-agent/http');
 
 class SmartEq extends utils.Adapter {
   /**
@@ -51,7 +53,14 @@ class SmartEq extends utils.Adapter {
       this.cookieJar = tough.CookieJar.fromJSON(cookies.val);
     }
 
-    this.requestClient = wrapper(axios.create({ jar: this.cookieJar }));
+    if (this.config.loginProxyUrl) {
+      const HttpsProxyCookieAgent = createCookieAgent(HttpsProxyAgent);
+      this.proxyAgent = new HttpsProxyCookieAgent(this.config.loginProxyUrl, { cookies: { jar: this.cookieJar }});
+    } else {
+      this.proxyAgent = new HttpsCookieAgent({ cookies: { this.cookieJar } });
+    }
+
+    this.requestClient = wrapper(axios.create());
     this.updateInterval = null;
     this.reLoginTimeout = null;
     this.refreshTokenTimeout = null;
@@ -61,6 +70,7 @@ class SmartEq extends utils.Adapter {
       this.deviceId = crypto.randomBytes(16).toString('hex');
       await this.loginHello();
 
+      this.log.debug('token: ' + this.session.accessToken);
       if (this.session.accessToken) {
         await this.getDeviceListHello();
         await this.updateDevicesHello();
@@ -100,10 +110,12 @@ class SmartEq extends utils.Adapter {
       }, expires_in);
     }
   }
+
   async loginHello() {
     this.log.info('Login into Hello Smart');
     const context = await this.requestClient({
       method: 'get',
+      httpsAgent: this.proxyAgent,
       url: 'https://awsapi.future.smart.com/login-app/api/v1/authorize?uiLocales=de-DE&uiLocales=de-DE',
       headers: {
         'upgrade-insecure-requests': '1',
@@ -119,12 +131,18 @@ class SmartEq extends utils.Adapter {
         'accept-language': 'de-DE,de;q=0.9,en-DE;q=0.8,en-US;q=0.7,en;q=0.6',
       },
     }).then((res) => {
-      this.log.debug(JSON.stringify(res.data));
+      this.log.info(JSON.stringify(res.data));
       return qs.parse(res.request.path.split('?')[1]);
+    }).catch(error => {
+	this.log.error('awsapi.future.smart.com/login-app');
+        this.log.error(error);
+        error.response && this.log.error(JSON.stringify(error.response.data));
+
     });
 
     const loginResponse = await this.requestClient({
       method: 'post',
+      httpsAgent: this.proxyAgent,
       maxBodyLength: Infinity,
       url: 'https://auth.smart.com/accounts.login',
       headers: {
@@ -162,10 +180,11 @@ class SmartEq extends utils.Adapter {
       },
     })
       .then((res) => {
-        this.log.debug(JSON.stringify(res.data));
+        this.log.info(JSON.stringify(res.data));
         return res.data;
       })
       .catch((error) => {
+	this.log.error('auth.smart.com/accounts.login');
         this.log.error(error);
         error.response && this.log.error(JSON.stringify(error.response.data));
       });
@@ -184,6 +203,7 @@ class SmartEq extends utils.Adapter {
     }
     this.gtokens = await this.requestClient({
       method: 'get',
+      httpsAgent: this.proxyAgent,
       maxBodyLength: Infinity,
       url:
         'https://auth.smart.com/oidc/op/v1.0/3_L94eyQ-wvJhWm7Afp1oBhfTGXZArUfSHHW9p9Pncg513hZELXsxCfMWHrF8f5P5a/authorize/continue?context=' +
@@ -207,7 +227,7 @@ class SmartEq extends utils.Adapter {
       },
     })
       .then((res) => {
-        this.log.debug(res.request.path);
+        this.log.info(res.request.path);
         const tokens = qs.parse(res.request.path.split('?')[1]);
         if (!tokens.access_token) {
           this.log.error('Login failed #2');
@@ -215,11 +235,12 @@ class SmartEq extends utils.Adapter {
           this.log.error(res.request.path);
           return;
         }
-        this.log.debug(JSON.stringify(res.data));
+	this.log.info('token: ' + tokens.access_token);
 
         return tokens;
       })
       .catch((error) => {
+	this.log.error('auth.smart.com/oidc/op');
         this.log.error(error);
         error.response && this.log.error(JSON.stringify(error.response.data));
       });
@@ -227,6 +248,7 @@ class SmartEq extends utils.Adapter {
     this.log.info('Login successful');
   }
   async getCurrentToken() {
+    this.log.info('get new token');
     const timestamp = Date.now();
     const nonce = crypto.randomBytes(16).toString('hex');
     const params = { identity_type: 'smart' };
@@ -238,6 +260,7 @@ class SmartEq extends utils.Adapter {
     const sign = this.creasteSignatureHello(nonce, params, timestamp, method, url, data);
     await this.requestClient({
       method: 'post',
+      jar: this.cookieJar,
       maxBodyLength: Infinity,
       url: 'https://api.ecloudeu.com/auth/account/session/secure',
       headers: {
@@ -266,14 +289,14 @@ class SmartEq extends utils.Adapter {
       params: params,
     })
       .then((res) => {
-        this.log.debug(JSON.stringify(res.data));
         if (res.data.data) {
           this.session = res.data.data;
+	  this.log.info('update session: ' + JSON.stringify(this.session));
         }
         this.setState('info.connection', true, true);
       })
       .catch((error) => {
-        this.log.error(error);
+        this.log.error('get new token: ' + error);
         this.setState('info.connection', false, true);
         error.response && this.log.error(JSON.stringify(error.response.data));
       });
@@ -306,6 +329,7 @@ ${url}`;
     const sign = this.creasteSignatureHello(nonce, params, timestamp, method, url);
     await this.requestClient({
       method: 'get',
+      jar: this.cookieJar,
       maxBodyLength: Infinity,
       url: 'https://api.ecloudeu.com' + url,
       headers: {
@@ -395,6 +419,7 @@ ${url}`;
       const sign = this.creasteSignatureHello(nonce, params, timestamp, method, url);
       await this.requestClient({
         method: 'get',
+        jar: this.cookieJar,
         maxBodyLength: Infinity,
         url: 'https://api.ecloudeu.com' + url,
         headers: {
@@ -452,6 +477,7 @@ ${url}`;
       this.session.code_verifier = code_verifier;
       this.session.resume = await this.requestClient({
         method: 'get',
+        jar: this.cookieJar,
         url:
           'https://id.mercedes-benz.com/as/authorization.oauth2?client_id=70d89501-938c-4bec-82d0-6abb550b0825&response_type=code&scope=openid+profile+email+phone+ciam-uid+offline_access&redirect_uri=https://oneapp.microservice.smart.mercedes-benz.com&acr_values=mfa&code_challenge=' +
           codeChallenge +
@@ -478,6 +504,7 @@ ${url}`;
 
       await this.requestClient({
         method: 'post',
+        jar: this.cookieJar,
         url: 'https://id.mercedes-benz.com/ciam/auth/login/user',
         headers: {
           'Content-Type': 'application/json',
@@ -505,6 +532,7 @@ ${url}`;
 
       await this.requestClient({
         method: 'post',
+        jar: this.cookieJar,
         url: 'https://id.mercedes-benz.com/ciam/auth/login/pass',
         headers: {
           'Content-Type': 'application/json',
@@ -540,6 +568,7 @@ ${url}`;
     } else {
       const token = await this.requestClient({
         method: 'post',
+        jar: this.cookieJar,
         url: 'https://id.mercedes-benz.com/ciam/auth/login/otp',
         headers: {
           'Content-Type': 'application/json',
@@ -582,6 +611,7 @@ ${url}`;
       }
       const code = await this.requestClient({
         method: 'post',
+        jar: this.cookieJar,
         url: 'https://id.mercedes-benz.com' + this.session.resume,
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -612,6 +642,7 @@ ${url}`;
 
       await this.requestClient({
         method: 'post',
+        jar: this.cookieJar,
         url: 'https://id.mercedes-benz.com/as/token.oauth2',
         headers: {
           Accept: '*/*',
@@ -1034,6 +1065,7 @@ ${url}`;
               this.log.info(JSON.stringify(res.data));
             })
             .catch((error) => {
+	      this.log.error('api.ecloudeu');
               this.log.error(error);
               if (error.response) {
                 this.log.error(JSON.stringify(error.response.data));
@@ -1074,6 +1106,7 @@ ${url}`;
               return res.data;
             })
             .catch((error) => {
+	      this.log.error(url);
               this.log.error(error);
               if (error.response) {
                 this.log.error(JSON.stringify(error.response.data));

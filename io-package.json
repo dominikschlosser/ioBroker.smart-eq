@@ -97,7 +97,8 @@
     "password": "",
     "otp": "",
     "interval": 10,
-    "type": "eq"
+    "type": "eq",
+    "loginProxyUrl": ""
   },
   "objects": [],
   "instanceObjects": [
